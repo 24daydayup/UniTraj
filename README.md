@@ -1,5 +1,4 @@
-This repository contains the code to reproduce the experiments for the paper titled “UniTraj: Universal Human Trajectory Modeling from
-Billion-Scale Worldwide Traces” 
+This repository contains the code to reproduce the experiments for the paper titled “UniTraj: earning a Universal Trajectory Foundation Model from Billion-Scale Worldwide Traces”.
 
 **Requirements**
 
