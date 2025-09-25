@@ -55,7 +55,7 @@ python main.py
 
 <img src="./Logo.png" alt="Logo" style="zoom:10%;" />
 
-The full WorldTrace dataset is released in 🤗 [Huggingface](https://huggingface.co/datasets/OpenTrace/WorldTrace) and ![img](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAAXNSR0IArs4c6QAAAARzQklUCAgICHwIZIgAAAH/SURBVGiB7ZkxTtxAFIa/WbFUsDJNukiL6KPkBssdaFIhGqJ0OQdHQEhZ0aQMK0UhEgW+gSlSgEJ2V1nRgEBWgMaAXwrkIijPMzbZtS3N17434//TeGZkGTwej6dKjFZ4913ENjg8tT/g5NWRS44YiDHsAQOW34QugwBaro1TJgC6CB8QDhlFh4yirsvAugj8jdBDiBhFr22t9RR4JED4bFuJOgvA42v1Ma+h7gIAPX5EPa3YBAGYY10rNUNAUDdzMwSgqxXmtML+rvUe49dWS70ICzGMbA8LtEJTVkDFC1SNF6gaL1A1jRdQL6Kd97fy4uXzJk/iNmtb89bL7tOm/evv7bb55zzqClxMDOcT27Q6SdzmLm6Xn8CR3FeorMSswoPDHigqMcvw4LiJXSVmHR4KnEI2iSrCQ8FjVJOoKjyUuAeeSlQZHnI+aPK4mBhACBarDQ8lBQCOJ0KwIKx08vtcLqmDsxtbS6wVSglcknIlwtV1AsBKZ77MNM6IiCpQeA9k4TOG1wk/fyclo7lhTGtPqxUSeBo+Y9oSqZGBVnMW0MJnTEtCIOx/WQy1upOALXzGFCRiebjfyGuwCriGz/hvEiLjVO5X+9+WxnltuQJFw2c8V0IgTNOH1f7XJevvHfUYLRs+Y1jsiI0FxgZzlKbpoL/fUU8dj8fjqRd/AB3a6/4sQ/d7AAAAAElFTkSuQmCC) [Modelscope](https://www.modelscope.cn/datasets/opentrace/WorldTrace).
+The full WorldTrace dataset is released in 🤗 [Huggingface](https://huggingface.co/datasets/OpenTrace/WorldTrace) and <img src="https://registry.npmmirror.com/@lobehub/icons-static-png/latest/files/light/modelscope-color.png" alt="img" style="zoom:3%;" /> [Modelscope](https://www.modelscope.cn/datasets/opentrace/WorldTrace).
 
 We also provide a sample of the WorldTrace dataset in the *data/ directory* to help you get started quickly.
 
