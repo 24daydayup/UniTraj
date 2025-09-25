@@ -57,7 +57,7 @@ python main.py
 
 The full WorldTrace dataset is released in 🤗 [Huggingface](https://huggingface.co/datasets/OpenTrace/WorldTrace) and  [Modelscope](https://www.modelscope.cn/datasets/opentrace/WorldTrace).
 
-We also provide a sample of the WorldTrace dataset in the *data/ directory* to help you get started quickly.
+We also provide a sample of the WorldTrace dataset in the *data/directory* to help you get started quickly.
 
 - data/worldtrace_sample.pkl: A subset of the dataset containing 1,000 trajectories.
 
