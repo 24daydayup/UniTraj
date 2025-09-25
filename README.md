@@ -1,4 +1,4 @@
-# UniTraj: earning a Universal Trajectory Foundation Model from Billion-Scale Worldwide Traces
+# UniTraj: Learning a Universal Trajectory Foundation Model from Billion-Scale Worldwide Traces
 
 ## Overview
 This repository contains the implementation of the NeurIPS 2025 accepted paper UniTraj. It is a universal trajectory foundation model designed to overcome the limitations of existing methods, such as task specificity, regional dependency, and data sensitivity. 
