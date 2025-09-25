@@ -55,7 +55,7 @@ python main.py
 
 <img src="./Logo.png" alt="Logo" style="zoom:10%;" />
 
-The full WorldTrace dataset is released in 🤗 [Huggingface](https://huggingface.co/datasets/OpenTrace/WorldTrace) and <img src="https://registry.npmmirror.com/@lobehub/icons-static-png/latest/files/light/modelscope-color.png" alt="img" style="zoom:3%;" /> [Modelscope](https://www.modelscope.cn/datasets/opentrace/WorldTrace).
+The full WorldTrace dataset is released in 🤗 [Huggingface](https://huggingface.co/datasets/OpenTrace/WorldTrace) and  [Modelscope](https://www.modelscope.cn/datasets/opentrace/WorldTrace).
 
 We also provide a sample of the WorldTrace dataset in the *data/ directory* to help you get started quickly.
 
