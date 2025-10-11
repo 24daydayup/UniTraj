@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from utils.config import args
 from utils.dataset import *
 from utils.unitraj import *
+from utils.unitraj_diffusion import UniTrajDiffusion
 from utils.logger import Logger, log_info
 from pathlib import Path
 import shutil
@@ -26,15 +27,14 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 def main(config, logger):
 
     # Create the model
-    model = UniTraj(
+    model = UniTrajDiffusion(
         trajectory_length=200,
         patch_size=1,
         embedding_dim=128,
         encoder_layers=8,
         encoder_heads=4,
-        decoder_layers=8,
-        decoder_heads=4,
         mask_ratio=0.5,
+        T=1000,   # 训练步数；推理可用 DDIM 20~50 步采样（后续加）
     )
 
     if torch.cuda.device_count() > 1:
@@ -80,26 +80,43 @@ def main(config, logger):
         for batch_idx, batch in enumerate(dataloader):
             traj, atten_mask = batch["trajectory"], batch["attention_mask"]
             interval, indices = batch["intervals"], batch["indices"]
+
+            # send to device (注意：indices 可能是 LongTensor 或 numpy，需要确认)
             interval = interval.to(device)
             traj = traj.to(device)
             atten_mask = atten_mask.to(device)
-            atten_mask = atten_mask.unsqueeze(1).expand_as(traj)
+            # 如果 indices 是 tensor，放到 device；如果是 numpy 则保持原样（encoder 可能接受 numpy）
+            if isinstance(indices, torch.Tensor):
+                indices = indices.to(device)
 
+            # atten_mask: [B, L] -> [B,1,L] -> 扩展到与 traj 同 shape [B, C, L]
+            atten_mask = atten_mask.unsqueeze(1).expand_as(traj)   # traj [B, C, L]
 
-            predicted_traj, mask = model(traj, interval, indices)
-            loss = torch.mean((predicted_traj - traj) ** 2 * mask * atten_mask) / 0.5
-            
+            # 前向返回噪声预测 eps_hat、真实噪声 eps、以及 mask（被掩码位置），形状假定为 [B,2,L]
+            eps_hat, eps, mask = model(traj, interval, indices)   # [B,2,L], [B,2,L], [B,2,L]
+
+            # 若 model 返回的 mask 是 [B,1,L]，请扩展到通道维：
+            if mask.dim() == 3 and mask.shape[1] == 1 and traj.shape[1] != 1:
+                mask = mask.expand(-1, traj.shape[1], -1)  # [B,2,L]
+
+            # 计算在 mask & atten_mask 上的 MSE
+            denom = (mask * atten_mask).sum().clamp_min(1.0)   # 防止除 0
+            loss = ((eps_hat - eps) ** 2 * mask * atten_mask).sum() / denom
+
+            # 优化步（保持你当前的风格）
             optim.zero_grad()
             loss.backward()
             optim.step()
-            
+
             train_losses.append(loss.item())
-            
-            break
-            
-        avg_train_loss = np.mean(train_losses)
+
+            # 注意：下面这行通常是用于调试/快跑，训练时请删除或注释
+            # break
+
+        avg_train_loss = np.mean(train_losses) if len(train_losses) > 0 else 0.0
         logger.info(f"Epoch {epoch} Training Loss: {avg_train_loss:.5f}")
 
+        # ========== 验证 ==========
         model.eval()
         val_losses = []
         with torch.no_grad():
@@ -107,18 +124,29 @@ def main(config, logger):
                 traj, atten_mask = batch["trajectory"], batch["attention_mask"]
                 interval = batch["intervals"]
                 indices = batch["indices"]
+
                 interval = interval.to(device)
                 traj = traj.to(device)
                 atten_mask = atten_mask.to(device)
+                if isinstance(indices, torch.Tensor):
+                    indices = indices.to(device)
+
                 atten_mask = atten_mask.unsqueeze(1).expand_as(traj)
-                
-                predicted_traj, mask = model(traj, interval, indices)
-                val_loss = torch.mean((predicted_traj - traj) ** 2 * mask * atten_mask) / 0.5
+
+                # 与训练一致，使用噪声回归
+                eps_hat, eps, mask = model(traj, interval, indices)
+
+                if mask.dim() == 3 and mask.shape[1] == 1 and traj.shape[1] != 1:
+                    mask = mask.expand(-1, traj.shape[1], -1)  # [B,2,L]
+
+                denom = (mask * atten_mask).sum().clamp_min(1.0)
+                val_loss = ((eps_hat - eps) ** 2 * mask * atten_mask).sum() / denom
+
                 val_losses.append(val_loss.item())
-        
-        avg_val_loss = np.mean(val_losses)
+
+        avg_val_loss = np.mean(val_losses) if len(val_losses) > 0 else 0.0
         logger.info(f"Epoch {epoch} Validation Loss: {avg_val_loss:.5f}")
-        
+
         scheduler.step(avg_val_loss)
     
         # early stopping
