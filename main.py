@@ -19,9 +19,9 @@ from pathlib import Path
 import shutil
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "5"
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,2,3,4"
 
 
 def main(config, logger):
@@ -43,8 +43,7 @@ def main(config, logger):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
-    # file_path = "../data/worldtrace_train.pkl"
-    file_path = './data/worldtrace_sample.pkl'
+    file_path = "/vol/zc/UniTraj/data/worldtrace_train.pkl"
     normalize_transform = Normalize()
     dataset = TrajectoryDataset(
         data_path=file_path, max_len=200, transform=normalize_transform
@@ -52,7 +51,7 @@ def main(config, logger):
     dataloader = DataLoader(
         dataset, batch_size=config.training.batch_size, shuffle=True, num_workers=32, pin_memory=True)
 
-    val_file_path = './data/worldtrace_sample.pkl'
+    val_file_path = "/vol/zc/UniTraj/data/worldtrace_test.pkl"
     dataset_val = TrajectoryDataset(
         data_path= val_file_path,
         max_len=200,

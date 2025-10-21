@@ -20,6 +20,9 @@ class UniTrajDiffusion(nn.Module):
                  T=1000):
         super().__init__()
         self.T = T
+        self.trajectory_length = trajectory_length
+        self.patch_size = patch_size
+        self.encoder_dim = embedding_dim
         # 线性 beta 调度（训练单步）
         betas = torch.linspace(1e-4, 2e-2, T)
         alphas = 1. - betas
@@ -88,3 +91,38 @@ class UniTrajDiffusion(nn.Module):
         # 为了与 main.py 现有广播逻辑兼容，返回 2 通道 mask
         mask_2ch = mask.expand(-1, 2, -1)  # [B,2,L]
         return eps_hat, eps, mask_2ch
+
+    def forward_diffusion(self, x_t, t, x_obs, mask, delta_t, enc_feat):
+        """单步去噪预测，保持时间步为 float 便于 Sinusoidal 嵌入。"""
+        if t.dtype != torch.float32:
+            t = t.float()
+        return self.denoiser(x_t, t, x_obs, mask, delta_t, enc_feat=enc_feat)
+
+    def sample(self, batch_size=1, n_steps=50, device=None):
+        """DDIM 采样，返回生成的轨迹序列。"""
+        device = torch.device(device or next(self.parameters()).device)
+        self.eval()
+        with torch.no_grad():
+            L = self.trajectory_length
+            x_t = torch.randn((batch_size, 2, L), device=device)
+            mask = torch.ones(batch_size, 1, L, device=device)
+            x_obs = torch.zeros_like(x_t)
+            delta_t = torch.zeros(batch_size, 1, L, device=device)
+            enc_feat = torch.zeros(batch_size, self.encoder_dim, device=device)
+
+            times = torch.linspace(self.T - 1, 0, steps=n_steps + 1, device=device, dtype=torch.long)
+
+            for i in range(n_steps):
+                t_now = times[i]
+                t_next = times[i + 1]
+
+                t_batch = torch.full((batch_size,), t_now, device=device, dtype=torch.long)
+                eps_pred = self.forward_diffusion(x_t, t_batch, x_obs, mask, delta_t, enc_feat)
+
+                alphabar_now = self.alphabar[t_now].view(1, 1, 1)
+                alphabar_next = self.alphabar[t_next].view(1, 1, 1)
+
+                x0_pred = (x_t - torch.sqrt(1.0 - alphabar_now) * eps_pred) / torch.sqrt(alphabar_now)
+                x_t = torch.sqrt(alphabar_next) * x0_pred + torch.sqrt(1.0 - alphabar_next) * eps_pred
+
+        return x_t
