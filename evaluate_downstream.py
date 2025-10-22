@@ -178,41 +178,40 @@ def ddim_sample(model, x_obs, mask, intervals, n_steps=50):
     """
     device = x_obs.device
     B, _, L = x_obs.shape
-    
-    # Get encoder features
+
+    # === Get encoder features ===
     if intervals is not None:
         intervals_emb = intervals.unsqueeze(-1)  # [B, L, 1]
         interval_embeddings = model.interval_embedding(intervals_emb)  # [B, L, C]
     else:
         interval_embeddings = model.interval_embedding(torch.zeros(B, L, 1, device=device))
-    
-    # Get mask indices for encoder
-    mask_indices = []
-    for b in range(B):
-        indices = torch.where(mask[b, 0] == 1)[0]
-        mask_indices.append(indices)
-    mask_indices = torch.nn.utils.rnn.pad_sequence(mask_indices, batch_first=True).long()
-    
-    mi_np = mask_indices.cpu().numpy()
-    features, _ = model.encoder(x_obs, interval_embeddings, mi_np)
+
+    # [FIX-C] Build per-sample mask index lists (no padding to avoid treating 0 as masked)
+    mask_indices = [torch.where(mask[b, 0] == 1)[0].cpu().numpy() for b in range(B)]
+    features, _ = model.encoder(x_obs, interval_embeddings, mask_indices)
     enc_feat = features[0]  # [B, C]
-    
-    # DDIM sampling
+
+    # === DDIM sampling with inpainting constraint on observed points ===
     x_t = torch.randn_like(x_obs)  # Start from noise
     delta_t = intervals.unsqueeze(1) if intervals is not None else torch.zeros(B, 1, L, device=device)
-    
+    z = torch.randn_like(x_obs)     # [FIX-C] fixed noise to re-noise observed points each step
+
     times = torch.linspace(model.T - 1, 0, steps=n_steps + 1, device=device, dtype=torch.long)
     
     for i in range(n_steps):
         t_now = times[i]
         t_next = times[i + 1]
         t_batch = torch.full((B,), t_now, device=device, dtype=torch.long)
-        
-        eps_pred = model.denoiser(x_t, t_batch.float(), x_obs, mask, delta_t, enc_feat=enc_feat)
-        
+
+        # [FIX-C] re-noise observed positions to q(x_t | x0 = x_obs) and clamp them
         alphabar_now = model.alphabar[t_now].view(1, 1, 1)
+        x_obs_t = torch.sqrt(alphabar_now) * x_obs + torch.sqrt(1.0 - alphabar_now) * z
+        x_t = x_t * mask + x_obs_t * (1 - mask)
+
+        # predict epsilon and DDIM update
+        eps_pred = model.denoiser(x_t, t_batch.float(), x_obs, mask, delta_t, enc_feat=enc_feat)
+
         alphabar_next = model.alphabar[t_next].view(1, 1, 1)
-        
         x0_pred = (x_t - torch.sqrt(1.0 - alphabar_now) * eps_pred) / torch.sqrt(alphabar_now)
         x_t = torch.sqrt(alphabar_next) * x0_pred + torch.sqrt(1.0 - alphabar_next) * eps_pred
     
@@ -256,8 +255,9 @@ def evaluate_trajectory_prediction(model, dataloader, evaluator, device, transfo
             # DDIM sampling
             x_pred = ddim_sample(model, x_obs, pred_mask, intervals, n_steps=n_steps)
             
-            # Evaluate only on predicted points
-            eval_mask = pred_mask[:, 0, :]  # [B, L]
+            # [FIX-A] Evaluate only on predicted points within valid (non-PAD) region
+            # boolean mask keeps evaluator logic unchanged
+            eval_mask = ((pred_mask[:, 0, :] > 0) & (attention_mask > 0))
             results = evaluator.evaluate_batch(x_pred, traj, eval_mask, originals, transform)
             
             all_results['MAE'].append(results['MAE'])
@@ -302,16 +302,18 @@ def evaluate_trajectory_completion(model, dataloader, evaluator, device, transfo
             
             B, _, L = traj.shape
             
-            # Create mask from indices
+            # Create mask from indices (only within valid length)
             mask = torch.zeros(B, 1, L, device=device)
             for b in range(B):
                 if isinstance(indices, torch.Tensor):
                     mask_idx = indices[b].to(device)
                 else:
                     mask_idx = torch.tensor(indices[b], device=device)
-                valid_idx = mask_idx[mask_idx < L]
-                if len(valid_idx) > 0:
-                    mask[b, 0, valid_idx] = 1
+                valid_len = int(attention_mask[b].sum().item())
+                if valid_len > 0:
+                    valid_idx = mask_idx[(mask_idx >= 0) & (mask_idx < valid_len)]
+                    if valid_idx.numel() > 0:
+                        mask[b, 0, valid_idx] = 1
             
             # Observed trajectory
             x_obs = traj * (1 - mask)
@@ -319,8 +321,8 @@ def evaluate_trajectory_completion(model, dataloader, evaluator, device, transfo
             # DDIM sampling
             x_pred = ddim_sample(model, x_obs, mask, intervals, n_steps=n_steps)
             
-            # Evaluate on masked points
-            eval_mask = mask[:, 0, :]  # [B, L]
+            # [FIX-A] Evaluate only on masked points that are valid (exclude PAD)
+            eval_mask = ((mask[:, 0, :] > 0) & (attention_mask > 0))
             results = evaluator.evaluate_batch(x_pred, traj, eval_mask, originals, transform)
             
             all_results['MAE'].append(results['MAE'])
