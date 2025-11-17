@@ -17,11 +17,12 @@ from utils.unitraj_diffusion import UniTrajDiffusion
 from utils.logger import Logger, log_info
 from pathlib import Path
 import shutil
+from utils.knowledge_base import TrajectoryKnowledgeBase
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "5"
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,2,3,4"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2,3,4,5,6,7"
 
 
 def main(config, logger):
@@ -64,6 +65,40 @@ def main(config, logger):
         num_workers=16,
     )
 
+    # ---------- RAG: 加载知识库 ---------- 
+    if hasattr(config, "rag") and getattr(config.rag, "enable", False):
+        kb_path = getattr(config.rag, "kb_path", "data/kb_means.pt")
+        topk = getattr(config.rag, "topk", 3)
+        temperature = getattr(config.rag, "temperature", 0.07)
+        inject_prior_in_train = getattr(config.rag, "inject_prior_in_train", False)
+        inject_prior_in_sample = getattr(config.rag, "inject_prior_in_sample", True)
+        
+        # 检查知识库文件是否存在
+        if not os.path.exists(kb_path):
+            logger.error(f"[RAG] 知识库文件不存在: {kb_path}")
+            logger.error("[RAG] 请先运行 build_knowledge_base.py 构建知识库")
+            logger.error("[RAG] 命令示例: python build_knowledge_base.py")
+            raise FileNotFoundError(f"知识库文件不存在: {kb_path}")
+        
+        try:
+            logger.info(f"[RAG] 加载知识库: {kb_path}")
+            kb = TrajectoryKnowledgeBase.load(kb_path)
+            
+            # 注入到模型（DataParallel 兼容）
+            if isinstance(model, torch.nn.DataParallel):
+                model.module.set_knowledge_base(kb, topk=topk, temperature=temperature,
+                                                inject_prior_in_train=inject_prior_in_train,
+                                                inject_prior_in_sample=inject_prior_in_sample)
+            else:
+                model.set_knowledge_base(kb, topk=topk, temperature=temperature,
+                                         inject_prior_in_train=inject_prior_in_train,
+                                         inject_prior_in_sample=inject_prior_in_sample)
+            logger.info("[RAG] 知识库加载成功")
+            logger.info(f"[RAG] 知识库包含 {kb.means.shape[0]} 个轨迹原型")
+            
+        except Exception as e:
+            logger.error(f"[RAG] 知识库加载失败: {e}")
+            raise RuntimeError(f"知识库加载失败: {e}")
 
     # optimizer
     optim = torch.optim.Adam(model.parameters(), lr=1e-3)  # Optimizer
@@ -130,7 +165,7 @@ def main(config, logger):
                 if isinstance(indices, torch.Tensor):
                     indices = indices.to(device)
 
-                atten_mask = atten_mask.unsqueeze(1).expand_as(traj)
+                atten_mask = atten_mask.unsqueeze(1).expand_as(traj)  
 
                 # 与训练一致，使用噪声回归
                 eps_hat, eps, mask = model(traj, interval, indices)

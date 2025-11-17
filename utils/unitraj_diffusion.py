@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from utils.unitraj import Encoder          # 直接复用你的 Encoder
 from utils.denoiser import TrajDenoiser    # 去噪器
+from utils.knowledge_base import TrajectoryKnowledgeBase  # 新增：知识库
 
 class UniTrajDiffusion(nn.Module):
     """
@@ -23,6 +24,12 @@ class UniTrajDiffusion(nn.Module):
         self.trajectory_length = trajectory_length
         self.patch_size = patch_size
         self.encoder_dim = embedding_dim
+        # RAG 相关默认参数
+        self.kb: TrajectoryKnowledgeBase | None = None
+        self.rag_topk = 3
+        self.rag_temperature = 0.07
+        self.inject_prior_in_train = False
+        self.inject_prior_in_sample = True
         # 线性 beta 调度（训练单步）
         betas = torch.linspace(1e-4, 2e-2, T)
         alphas = 1. - betas
@@ -36,6 +43,22 @@ class UniTrajDiffusion(nn.Module):
 
         # 条件去噪器（坐标通道=2，条件通道= x_obs(2) + mask(1) + Δt(1)）
         self.denoiser = TrajDenoiser(in_ch=2, cond_ch=4, hid=embedding_dim, enc_dim=embedding_dim)
+
+    # ---------- RAG 设置 ----------
+    def set_knowledge_base(
+        self,
+        kb: TrajectoryKnowledgeBase,
+        topk: int = 3,
+        temperature: float = 0.07,
+        inject_prior_in_train: bool = False,
+        inject_prior_in_sample: bool = True,
+    ):
+        """外部注入知识库与参数。"""
+        self.kb = kb
+        self.rag_topk = topk
+        self.rag_temperature = temperature
+        self.inject_prior_in_train = inject_prior_in_train
+        self.inject_prior_in_sample = inject_prior_in_sample
 
     def _noise(self, x0, t):
         """
@@ -81,6 +104,16 @@ class UniTrajDiffusion(nn.Module):
         x_obs = trajectory * (1. - mask)                                       # [B,2,L]
         delta_t = intervals.transpose(1, 2) if intervals is not None else torch.zeros(B,1,L,device=device)
 
+        # === RAG：全局上下文增强（训练阶段默认不注入轨迹先验） ===
+        if self.kb is not None:
+            rag_feat, rag_traj = self.kb.retrieve(
+                x_obs, mask, intervals, self.encoder, self.interval_embedding,
+                topk=self.rag_topk, temperature=self.rag_temperature
+            )  # rag_feat:[B,C], rag_traj:[B,2,L]
+            enc_feat = enc_feat + rag_feat
+            if self.inject_prior_in_train:
+                x_obs = x_obs * (1. - mask) + rag_traj * mask
+
         # 4) 采样步与加噪
         t = torch.randint(0, self.T, (B,), device=device)
         x_t, eps = self._noise(trajectory, t)  # 目标噪声
@@ -109,6 +142,18 @@ class UniTrajDiffusion(nn.Module):
             x_obs = torch.zeros_like(x_t)
             delta_t = torch.zeros(batch_size, 1, L, device=device)
             enc_feat = torch.zeros(batch_size, self.encoder_dim, device=device)
+
+            # 可选：无条件采样也可用 RAG 全局上下文（无观测 → 查询为全零，会退化为均匀注意力）
+            if self.kb is not None:
+                rag_feat, rag_traj = self.kb.retrieve(
+                    x_obs, mask, None, self.encoder, self.interval_embedding,
+                    topk=self.rag_topk, temperature=self.rag_temperature
+                )
+                enc_feat = enc_feat + rag_feat
+                if self.inject_prior_in_sample:
+                    x_obs = rag_traj.clone() * mask  # 无条件场景下，用先验填充缺失位
+            else:
+                rag_feat = None
 
             times = torch.linspace(self.T - 1, 0, steps=n_steps + 1, device=device, dtype=torch.long)
 

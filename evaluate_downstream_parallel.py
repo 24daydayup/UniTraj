@@ -1,25 +1,23 @@
 """
-Evaluation script for UniTraj downstream tasks: Trajectory Prediction and Completion
-Following NeurIPS 2025 paper: UniTraj
-Core metrics: MAE, RMSE (in meters)
+Multi-GPU Parallel Evaluation Script for UniTraj downstream tasks
+Modified for parallel execution on 3 GPUs (0, 1, 2)
 """
 
 import torch
+import torch.multiprocessing as mp
 import numpy as np
-import matplotlib.pyplot as plt
-from pathlib import Path
 import json
-from tqdm import tqdm
-from typing import Dict, Optional
-import sys
 import os
+from pathlib import Path
+from tqdm import tqdm
+from typing import Dict, List
+import time
 
 # Import project modules
 from utils.unitraj_diffusion import UniTrajDiffusion
 from utils.dataset import TrajectoryDataset, Normalize
 from utils.logger import Logger
 from torch.utils.data import DataLoader
-from utils.knowledge_base import TrajectoryKnowledgeBase
 
 
 def haversine_distance(lat1, lon1, lat2, lon2):
@@ -59,27 +57,24 @@ class TrajectoryEvaluator:
         Returns:
             traj_denorm: [L, 2] denormalized trajectory in real coordinates
         """
-        # Reverse normalization: multiply by std and add mean
-        if hasattr(transform, 'mean') and hasattr(transform, 'std'):
-            # Convert tensors to numpy for proper broadcasting
-            mean_np = transform.mean.cpu().numpy()
-            std_np = transform.std.cpu().numpy()
-            traj_denorm = traj_normalized * std_np + mean_np
-        else:
-            traj_denorm = traj_normalized
+        # 正确的反归一化流程：
+        # 1. 先反归一化：traj_normalized * std + mean
+        # 2. 再添加原始偏移量恢复真实坐标
         
-        # Add back the original offset
-        traj_denorm = traj_denorm + original.cpu().numpy()
+        # 转换为tensor进行反归一化
+        traj_tensor = torch.tensor(traj_normalized, dtype=torch.float32)
+        
+        # 反归一化：traj_normalized * std + mean
+        traj_denorm_tensor = traj_tensor * transform.std + transform.mean
+        
+        # 转换为numpy并添加原始偏移量
+        traj_denorm = traj_denorm_tensor.numpy() + original.cpu().numpy()
         
         return traj_denorm
-    
+
     def calculate_mae(self, pred: np.ndarray, gt: np.ndarray, mask: np.ndarray) -> float:
         """
         Mean Absolute Error in meters using Haversine distance
-        Args:
-            pred: [L, 2] predicted trajectory (lon, lat) in degrees
-            gt: [L, 2] ground truth trajectory (lon, lat) in degrees
-            mask: [L] boolean mask for valid points
         """
         valid_indices = np.where(mask)[0]
         if len(valid_indices) == 0:
@@ -97,7 +92,7 @@ class TrajectoryEvaluator:
             distances.append(dist)
         
         return np.mean(distances)
-    
+
     def calculate_rmse(self, pred: np.ndarray, gt: np.ndarray, mask: np.ndarray) -> float:
         """
         Root Mean Squared Error in meters using Haversine distance
@@ -118,20 +113,12 @@ class TrajectoryEvaluator:
             distances.append(dist)
         
         return np.sqrt(np.mean(np.array(distances) ** 2))
-    
+
     def evaluate_batch(self, pred_traj: torch.Tensor, gt_traj: torch.Tensor, 
                       eval_mask: torch.Tensor, originals: torch.Tensor,
                       transform) -> Dict:
         """
         Evaluate a batch of trajectories with denormalization
-        Args:
-            pred_traj: [B, 2, L] predicted trajectories (normalized)
-            gt_traj: [B, 2, L] ground truth trajectories (normalized)
-            eval_mask: [B, L] boolean mask for evaluation points
-            originals: [B, 2] original offsets
-            transform: Normalize transform
-        Returns:
-            Dictionary with MAE, RMSE metrics in meters
         """
         batch_size = pred_traj.shape[0]
         mae_list, rmse_list = [], []
@@ -166,27 +153,14 @@ class TrajectoryEvaluator:
         }
 
 
-def ddim_sample(model, x_obs, mask, intervals, n_steps=50, kb: Optional[TrajectoryKnowledgeBase] = None,
-                topk: int = 3, temperature: float = 0.07, fill_prior: bool = True):
+def ddim_sample(model, x_obs, mask, intervals, n_steps=50):
     """
     DDIM sampling for trajectory completion/prediction
-    Args:
-        model: UniTrajDiffusion model
-        x_obs: [B, 2, L] observed trajectory points
-        mask: [B, 1, L] mask (1 for missing, 0 for observed)
-        intervals: [B, L] time intervals
-        n_steps: number of DDIM sampling steps
-        kb: Knowledge base for RAG
-        topk: Top-k retrieval
-        temperature: Temperature for softmax
-        fill_prior: Whether to fill missing points with prior
-    Returns:
-        x_pred: [B, 2, L] completed trajectory
     """
     device = x_obs.device
     B, _, L = x_obs.shape
 
-    # === Get encoder features & (Optional) RAG prior ===
+    # === Get encoder features ===
     if intervals is not None:
         intervals_emb = intervals.unsqueeze(-1)  # [B, L, 1]
         interval_embeddings = model.interval_embedding(intervals_emb)  # [B, L, C]
@@ -197,17 +171,6 @@ def ddim_sample(model, x_obs, mask, intervals, n_steps=50, kb: Optional[Trajecto
     mask_indices = [torch.where(mask[b, 0] == 1)[0].cpu().numpy() for b in range(B)]
     features, _ = model.encoder(x_obs, interval_embeddings, mask_indices)
     enc_feat = features[0]  # [B, C]
-
-    # === RAG: 取 Top-3 原型做注意力加权 ===
-    if kb is not None:
-        rag_feat, rag_traj = kb.retrieve(
-            x_obs, mask, intervals, model.encoder, model.interval_embedding,
-            topk=topk, temperature=temperature
-        )
-        enc_feat = enc_feat + rag_feat
-        if fill_prior:
-            # 在缺失处写入轨迹先验，作为"更强"的观测条件
-            x_obs = x_obs * (1 - mask) + rag_traj * mask
 
     # === DDIM sampling with inpainting constraint on observed points ===
     x_t = torch.randn_like(x_obs)  # Start from noise
@@ -238,9 +201,105 @@ def ddim_sample(model, x_obs, mask, intervals, n_steps=50, kb: Optional[Trajecto
     return x_pred
 
 
+def evaluate_model_on_gpu(gpu_id: int, model_files: List[str], result_queue):
+    """
+    Evaluate models on a specific GPU
+    Args:
+        gpu_id: GPU device ID (0, 1, or 2)
+        model_files: List of model weight files to evaluate
+        result_queue: Queue for collecting results
+    """
+    device = torch.device(f'cuda:{gpu_id}')
+    
+    # Prepare dataset (shared across all models)
+    test_file_path = "data/worldtrace_test.pkl"
+    normalize_transform = Normalize()
+    test_dataset = TrajectoryDataset(
+        data_path=test_file_path,
+        max_len=200,
+        transform=normalize_transform,
+        mask_ratio=0.5
+    )
+    test_dataloader = DataLoader(
+        test_dataset,
+        batch_size=32,
+        shuffle=False,
+        num_workers=4,
+    )
+    
+    # Initialize evaluator
+    evaluator = TrajectoryEvaluator(device=device)
+    
+    for model_file in model_files:
+        try:
+            print(f"GPU {gpu_id}: Loading model {model_file}")
+            
+            # Load model
+            model = UniTrajDiffusion(
+                trajectory_length=200,
+                patch_size=1,
+                embedding_dim=128,
+                encoder_layers=8,
+                encoder_heads=4,
+                mask_ratio=0.5,
+                T=1000,
+            )
+            
+            model_path = f"/vol/zc/UniTraj/UniTraj/worldtrace_bs=1024/10-22-18-41-41/models/{model_file}"
+            model.load_state_dict(torch.load(model_path, map_location=device))
+            model = model.to(device)
+            model.eval()
+            
+            # Evaluate trajectory prediction
+            print(f"GPU {gpu_id}: Evaluating prediction for {model_file}")
+            prediction_results = evaluate_trajectory_prediction(
+                model=model,
+                dataloader=test_dataloader,
+                evaluator=evaluator,
+                device=device,
+                transform=normalize_transform,
+                n_steps=50,
+                num_predict=8,
+                save_dir=f'results/prediction_gpu{gpu_id}_{model_file.replace(".pt", "")}'
+            )
+            
+            # Evaluate trajectory completion
+            print(f"GPU {gpu_id}: Evaluating completion for {model_file}")
+            completion_results = evaluate_trajectory_completion(
+                model=model,
+                dataloader=test_dataloader,
+                evaluator=evaluator,
+                device=device,
+                transform=normalize_transform,
+                n_steps=50,
+                save_dir=f'results/completion_gpu{gpu_id}_{model_file.replace(".pt", "")}'
+            )
+            
+            # Collect results
+            result = {
+                'gpu_id': gpu_id,
+                'model_file': model_file,
+                'prediction_mae': prediction_results['MAE'],
+                'prediction_rmse': prediction_results['RMSE'],
+                'completion_mae': completion_results['MAE'],
+                'completion_rmse': completion_results['RMSE'],
+                'timestamp': time.time()
+            }
+            
+            result_queue.put(result)
+            print(f"GPU {gpu_id}: Completed evaluation for {model_file}")
+            
+        except Exception as e:
+            print(f"GPU {gpu_id}: Error evaluating {model_file}: {e}")
+            result_queue.put({
+                'gpu_id': gpu_id,
+                'model_file': model_file,
+                'error': str(e)
+            })
+
+
 def evaluate_trajectory_prediction(model, dataloader, evaluator, device, transform,
-                                   n_steps=50, num_predict=8, save_dir='results/prediction',
-                                   kb: Optional[TrajectoryKnowledgeBase] = None, topk=3, temperature=0.07):
+                                   n_steps=50, num_predict=8, save_dir='results/prediction'):
     """
     Evaluate trajectory prediction task (predict last N points)
     """
@@ -272,8 +331,7 @@ def evaluate_trajectory_prediction(model, dataloader, evaluator, device, transfo
             x_obs = traj * (1 - pred_mask)
             
             # DDIM sampling
-            x_pred = ddim_sample(model, x_obs, pred_mask, intervals, n_steps=n_steps,
-                                 kb=kb, topk=topk, temperature=temperature, fill_prior=True)
+            x_pred = ddim_sample(model, x_obs, pred_mask, intervals, n_steps=n_steps)
             
             # [FIX-A] Evaluate only on predicted points within valid (non-PAD) region
             # boolean mask keeps evaluator logic unchanged
@@ -300,8 +358,7 @@ def evaluate_trajectory_prediction(model, dataloader, evaluator, device, transfo
 
 
 def evaluate_trajectory_completion(model, dataloader, evaluator, device, transform,
-                                   n_steps=50, save_dir='results/completion',
-                                   kb: Optional[TrajectoryKnowledgeBase] = None, topk=3, temperature=0.07):
+                                   n_steps=50, save_dir='results/completion'):
     """
     Evaluate trajectory completion task (complete missing points using dataset masks)
     """
@@ -340,8 +397,7 @@ def evaluate_trajectory_completion(model, dataloader, evaluator, device, transfo
             x_obs = traj * (1 - mask)
             
             # DDIM sampling
-            x_pred = ddim_sample(model, x_obs, mask, intervals, n_steps=n_steps,
-                                 kb=kb, topk=topk, temperature=temperature, fill_prior=True)
+            x_pred = ddim_sample(model, x_obs, mask, intervals, n_steps=n_steps)
             
             # [FIX-A] Evaluate only on masked points that are valid (exclude PAD)
             eval_mask = ((mask[:, 0, :] > 0) & (attention_mask > 0))
@@ -367,106 +423,86 @@ def evaluate_trajectory_completion(model, dataloader, evaluator, device, transfo
 
 
 def main():
-    """Main evaluation function"""
-    # Configuration
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    """Main function for multi-GPU parallel evaluation"""
+    # Get all model files
+    model_dir = "/vol/zc/UniTraj/UniTraj/worldtrace_bs=1024/10-22-18-41-41/models"
+    model_files = sorted([f for f in os.listdir(model_dir) if f.endswith('.pt')])
     
-    # Load model
-    model = UniTrajDiffusion(
-        trajectory_length=200,
-        patch_size=1,
-        embedding_dim=128,
-        encoder_layers=8,
-        encoder_heads=4,
-        mask_ratio=0.5,
-        T=1000,
-    )
+    print(f"Found {len(model_files)} model files:")
+    for i, model_file in enumerate(model_files):
+        print(f"  {i+1}. {model_file}")
     
-    # Load trained weights
-    model_path = "/vol/zc/UniTraj/UniTraj/worldtrace_bs=1024/11-12-10-36-07/models/best_model_epoch_83.pt"
-    print(f"Loading model from: {model_path}")
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    model = model.to(device)
-    model.eval()
-    print("✅ Model loaded successfully!")
-
-    # === Load / build Knowledge Base (if exists) ===
-    kb_path = "data/kb_means.pt"
-    kb = None
-    try:
-        if os.path.exists(kb_path):
-            print(f"Loading KB from: {kb_path}")
-            kb = TrajectoryKnowledgeBase.load(kb_path)
-            model.set_knowledge_base(kb, topk=3, temperature=0.07,
-                                     inject_prior_in_train=False, inject_prior_in_sample=True)
-            print("✅ KB loaded.")
-        else:
-            print(f"KB not found at {kb_path}. Run main.py training with RAG enabled to build it.")
-    except Exception as e:
-        print(f"⚠️ KB load failed: {e}")
-
-    # Prepare dataset
-    test_file_path = "data/worldtrace_test.pkl"
-    print(f"Loading dataset from: {test_file_path}")
-    normalize_transform = Normalize()
-    test_dataset = TrajectoryDataset(
-        data_path=test_file_path,
-        max_len=200,
-        transform=normalize_transform,
-        mask_ratio=0.5
-    )
-    test_dataloader = DataLoader(
-        test_dataset,
-        batch_size=32,
-        shuffle=False,
-        num_workers=4,
-    )
+    # Distribute models across 3 GPUs
+    gpu_assignments = {0: [], 1: [], 2: []}
+    for i, model_file in enumerate(model_files):
+        gpu_id = i % 3
+        gpu_assignments[gpu_id].append(model_file)
     
-    # Initialize evaluator
-    evaluator = TrajectoryEvaluator(device=device)
+    print("\nGPU assignments:")
+    for gpu_id, files in gpu_assignments.items():
+        print(f"GPU {gpu_id}: {len(files)} models")
     
-    # Evaluate trajectory prediction
-    print("\n" + "="*50)
-    print("Evaluating Trajectory Prediction Task")
-    print("="*50)
-    prediction_results = evaluate_trajectory_prediction(
-        model=model,
-        dataloader=test_dataloader,
-        evaluator=evaluator,
-        device=device,
-        transform=normalize_transform,
-        n_steps=50,  # DDIM sampling steps
-        num_predict=8,  # Predict last 8 points
-        save_dir='results/prediction',
-        kb=None, topk=3, temperature=0.07
-    )
+    # Set up multiprocessing
+    mp.set_start_method('spawn', force=True)
+    result_queue = mp.Queue()
     
-    # Evaluate trajectory completion
-    print("\n" + "="*50)
-    print("Evaluating Trajectory Completion Task")
-    print("="*50)
-    completion_results = evaluate_trajectory_completion(
-        model=model,
-        dataloader=test_dataloader,
-        evaluator=evaluator,
-        device=device,
-        transform=normalize_transform,
-        n_steps=50,  # DDIM sampling steps
-        save_dir='results/completion',
-        kb=None, topk=3, temperature=0.07
-    )
+    # Start processes
+    processes = []
+    for gpu_id, model_files in gpu_assignments.items():
+        if model_files:  # Only start process if there are models to evaluate
+            p = mp.Process(target=evaluate_model_on_gpu, 
+                          args=(gpu_id, model_files, result_queue))
+            processes.append(p)
+            p.start()
     
-    # Print summary
-    print("\n" + "="*50)
-    print("Evaluation Summary (in meters)")
-    print("="*50)
-    print("\nTrajectory Prediction:")
-    print(f"  MAE:  {prediction_results['MAE']:.2f}")
-    print(f"  RMSE: {prediction_results['RMSE']:.2f}")
+    # Collect results
+    all_results = []
+    for _ in range(len(model_files)):
+        result = result_queue.get()
+        all_results.append(result)
     
-    print("\nTrajectory Completion:")
-    print(f"  MAE:  {completion_results['MAE']:.2f}")
-    print(f"  RMSE: {completion_results['RMSE']:.2f}")
+    # Wait for all processes to complete
+    for p in processes:
+        p.join()
+    
+    # Sort results by model file name
+    all_results.sort(key=lambda x: x['model_file'])
+    
+    # Save comprehensive results
+    results_dir = Path("parallel_evaluation_results")
+    results_dir.mkdir(exist_ok=True)
+    
+    # Save detailed results
+    with open(results_dir / 'detailed_results.json', 'w') as f:
+        json.dump(all_results, f, indent=4, default=str)
+    
+    # Save summary results
+    summary = []
+    for result in all_results:
+        if 'error' not in result:
+            summary.append({
+                'model_file': result['model_file'],
+                'gpu_id': result['gpu_id'],
+                'prediction_mae': result['prediction_mae'],
+                'prediction_rmse': result['prediction_rmse'],
+                'completion_mae': result['completion_mae'],
+                'completion_rmse': result['completion_rmse']
+            })
+    
+    with open(results_dir / 'summary_results.json', 'w') as f:
+        json.dump(summary, f, indent=4)
+    
+    # Print final summary
+    print("\n" + "="*80)
+    print("PARALLEL EVALUATION SUMMARY")
+    print("="*80)
+    
+    for result in summary:
+        print(f"\nModel: {result['model_file']} (GPU {result['gpu_id']})")
+        print(f"  Prediction - MAE: {result['prediction_mae']:.2f}m, RMSE: {result['prediction_rmse']:.2f}m")
+        print(f"  Completion - MAE: {result['completion_mae']:.2f}m, RMSE: {result['completion_rmse']:.2f}m")
+    
+    print(f"\nResults saved to: {results_dir}")
 
 
 if __name__ == "__main__":
